@@ -21,14 +21,14 @@ def load_df():
     cache_file = MODEL_ROOT / "dataset_cache.csv"
     if cache_file.exists():
         return pd.read_csv(cache_file, parse_dates=["Date"])
-    st.warning("使用本地缓存数据")
+    st.warning("使用缓存数据")
     return pd.DataFrame()
 
-st.title("ETF Predictive Allocation")
+st.title("ETF Price Forecast (Informer)")
 model_subdirs = discover_model_subdirs()
 
 if not model_subdirs:
-    st.error("未检测到本地模型，请先运行训练笔记")
+    st.error("未找到模型，请先运行训练脚本")
 else:
     models = {d: InformerForPrediction.from_pretrained(str(MODEL_ROOT / d)) for d in model_subdirs}
     model_options = list(models.keys())
@@ -40,41 +40,42 @@ else:
     meta = json.loads((MODEL_ROOT / "training_meta.json").read_text(encoding="utf-8"))
     df = load_df()
 
-    cols = meta["feature_cols"]
-    for c in cols:
+    feature_cols = meta["feature_cols"]
+    window_size = meta["window_size"]
+    pred_len = meta["pred_len"]
+
+    for c in feature_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[cols] = df[cols].ffill().bfill()
+    df[feature_cols] = df[feature_cols].ffill().bfill()
 
-    x = scaler.transform(df[cols].values)
-    ws = meta["window_size"]
-    pl = meta["pred_len"]
+    x = scaler.transform(df[feature_cols].values)
+    ctx = x[-window_size:]
 
-    ctx = x[-ws:]
-    future_feats = np.zeros((pl, len(cols)), dtype=np.float32)
+    # ✅ 关键修复：和训练完全一致 → future 用 0 矩阵
+    future_features = np.zeros((pred_len, len(feature_cols)), dtype=np.float32)
 
-    def run_one(m: InformerForPrediction) -> np.ndarray:
+    def run_one(m):
         with torch.no_grad():
-            past_values = torch.tensor(ctx[:, 3:4], dtype=torch.float32).unsqueeze(0)
-            past_time = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
-            future_time = torch.tensor(future_feats, dtype=torch.float32).unsqueeze(0)
+            past_val = torch.tensor(ctx[:, 3:4], dtype=torch.float32).unsqueeze(0)
+            past_tf = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
+            future_tf = torch.tensor(future_features, dtype=torch.float32).unsqueeze(0)
 
             out = m.generate(
-                past_values=past_values,
-                past_time_features=past_time,
-                past_observed_mask=torch.ones_like(past_values),
-                future_time_features=future_time,
+                past_values=past_val,
+                past_time_features=past_tf,
+                past_observed_mask=torch.ones_like(past_val),
+                future_time_features=future_tf,
             )
-        return out.prediction_outputs.squeeze().cpu().numpy()
+        return out.prediction_outputs.cpu().numpy().squeeze()
 
     if model_version == "ensemble":
-        preds = [run_one(m) for m in models.values()]
-        pred = np.mean(preds, axis=0)
+        pred = np.mean([run_one(m) for m in models.values()], axis=0)
     else:
         pred = run_one(models[model_version])
 
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
     last_close = float(close.iloc[-1])
-    future_dates = pd.bdate_range(df["Date"].iloc[-1], periods=pl+1)[1:]
+    future_dates = pd.bdate_range(df["Date"].iloc[-1], periods=pred_len+1)[1:]
 
     pred_price = [last_close]
     for r in pred:
@@ -82,7 +83,7 @@ else:
     pred_price = pred_price[1:]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["Date"].tail(250), y=close.tail(250), name="Actual"))
-    fig.add_trace(go.Scatter(x=future_dates, y=pred_price, name="Predicted", line=dict(dash="dash")))
-    fig.update_layout(template="plotly_dark", title="ETF Price Forecast")
+    fig.add_trace(go.Scatter(x=df["Date"].tail(250), y=close.tail(250), name="Actual Price"))
+    fig.add_trace(go.Scatter(x=future_dates, y=pred_price, name="Predicted", line=dict(dash="dot")))
+    fig.update_layout(template="plotly_dark", title="ETF Next 5 Days Prediction")
     st.plotly_chart(fig, use_container_width=True)
