@@ -1,0 +1,16 @@
+{
+  "feature_cols": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "CPI",
+    "Unemployment Rate",
+    "DXY",
+    "Gold/Copper Ratio"
+  ],
+  "window_size": 60,
+  "label_len": 30,
+  "pred_len": 5
+}
