@@ -1,4 +1,3 @@
-from __future__ import annotations
 from pathlib import Path
 import json
 import joblib
@@ -7,76 +6,58 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-from datasets import load_dataset
 from transformers import InformerForPrediction
 
-st.set_page_config(page_title="ETF Informer Dashboard", layout="wide")
+st.set_page_config(page_title="ETF 预测仪表盘", layout="wide")
 MODEL_ROOT = Path("./model")
-MODEL_CANDIDATE_DIRS = ["informer", "informer_v2", "informer_v3"]
 
-
-def discover_model_subdirs() -> list[str]:
-    found = [d for d in MODEL_CANDIDATE_DIRS if (MODEL_ROOT / d).exists()]
-    return found[:3]
-
-def load_df():
-    cache_file = MODEL_ROOT / "dataset_cache.csv"
-    if cache_file.exists():
-        return pd.read_csv(cache_file, parse_dates=["Date"])
-    ds = load_dataset("P2SAMAPA/my-etf-data")
-    split = "train" if "train" in ds else list(ds.keys())[0]
-    df = ds[split].to_pandas()
-    date_col = "Date" if "Date" in df.columns else "date"
-    df[date_col] = pd.to_datetime(df[date_col])
-    return df.sort_values(date_col).rename(columns={date_col: "Date"})
-
-st.title("ETF Predictive Allocation")
-model_subdirs = discover_model_subdirs()
-if not model_subdirs:
-    st.error("未检测到本地模型，请先运行 notebooks/train.ipynb。")
-else:
-    models = {d: InformerForPrediction.from_pretrained(str(MODEL_ROOT / d)) for d in model_subdirs}
-    model_options = list(models.keys())
-    if len(model_options) >= 2:
-        model_options.append("ensemble")
-    model_version = st.sidebar.selectbox("模型版本", model_options)
-
+@st.cache_resource
+def load_model():
+    model = InformerForPrediction.from_pretrained(str(MODEL_ROOT / "informer"))
     scaler = joblib.load(MODEL_ROOT / "scaler.joblib")
-    meta = json.loads((MODEL_ROOT / "training_meta.json").read_text(encoding="utf-8"))
-    df = load_df()
-    cols = [c for c in meta["feature_cols"] if c in df.columns]
-    for c in cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[cols] = df[cols].ffill().bfill()
-    x = scaler.transform(df[cols].values)
-    ws = int(meta["window_size"])
-    pl = int(meta["pred_len"])
-    ctx = x[-ws:]
-    future = np.repeat(ctx[-1:, :], pl, axis=0)
+    meta = json.load(open(MODEL_ROOT / "training_meta.json"))
+    df = pd.read_csv(MODEL_ROOT / "dataset_cache.csv", parse_dates=["Date"])
+    return model, scaler, meta, df
 
-    def run_one(m: InformerForPrediction) -> np.ndarray:
-        with torch.no_grad():
-            out = m.generate(
-                past_values=torch.tensor(ctx[:, 3:4][None, :, :], dtype=torch.float32),
-                past_time_features=torch.tensor(ctx[None, :, :], dtype=torch.float32),
-                past_observed_mask=torch.ones((1, ws, 1), dtype=torch.float32),
-                future_time_features=torch.tensor(future[None, :, :], dtype=torch.float32),
-            )
-        return out.sequences.mean(dim=1).squeeze(0).squeeze(-1).cpu().numpy()
+model, scaler, meta, df = load_model()
+feature_cols = meta["feature_cols"]
+window_size = meta["window_size"]
+pred_len = meta["pred_len"]
 
-    if model_version == "ensemble":
-        pred = np.mean(np.stack([run_one(m) for m in models.values()], axis=0), axis=0)
-    else:
-        pred = run_one(models[model_version])
-    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-    last_close = float(close.iloc[-1])
-    future_dates = pd.bdate_range(pd.to_datetime(df["Date"].iloc[-1]), periods=pl + 1)[1:]
-    pred_price = [last_close]
-    for r in pred:
-        pred_price.append(pred_price[-1] * (1 + float(r)))
-    pred_price = np.array(pred_price[1:])
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=pd.to_datetime(df["Date"]).tail(250), y=close.tail(250), name="Actual"))
-    fig.add_trace(go.Scatter(x=future_dates, y=pred_price, name="Predicted"))
-    fig.update_layout(template="plotly_dark", title="Price Forecast")
-    st.plotly_chart(fig, use_container_width=True)
+df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").ffill().bfill()
+X = scaler.transform(df[feature_cols].values)
+ctx = X[-window_size:]
+
+def run_one(m):
+    with torch.no_grad():
+        past_values = torch.tensor(ctx[:, 3:4], dtype=torch.float32).unsqueeze(0)
+        past_tf = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
+        future_tf = torch.zeros((1, pred_len, len(feature_cols)), dtype=torch.float32)
+
+        out = m(
+            past_values=past_values,
+            past_time_features=past_tf,
+            past_observed_mask=torch.ones_like(past_values),
+            future_time_features=future_tf,
+        )
+        
+    return out.prediction_outputs.squeeze().cpu().numpy()
+
+st.title("📈 ETF 价格预测 (Informer)")
+pred = run_one(model)
+
+last_close = df["Close"].dropna().iloc[-1]
+future_dates = pd.bdate_range(df["Date"].iloc[-1], periods=pred_len+1)[1:]
+
+pred_price = [last_close]
+for r in pred:
+    pred_price.append(pred_price[-1] * (1 + float(r)))
+pred_price = pred_price[1:]
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=df["Date"].tail(250), y=df["Close"].tail(250), name="历史价格"))
+fig.add_trace(go.Scatter(x=future_dates, y=pred_price, name="预测价格", line=dict(dash="dash")))
+fig.update_layout(template="plotly_dark")
+st.plotly_chart(fig, use_container_width=True)
+
+st.success(f"✅ 预测完成！未来 {pred_len} 天价格：{pred_price[-1]:.2f}")
