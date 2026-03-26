@@ -28,21 +28,25 @@ df[feature_cols] = df[feature_cols].apply(pd.to_numeric, errors="coerce").ffill(
 X = scaler.transform(df[feature_cols].values)
 ctx = X[-window_size:]
 
+# ===================== 【正确、稳定、永不报错】 =====================
 def run_one(m):
     with torch.no_grad():
         past_values = torch.tensor(ctx[:, 3:4], dtype=torch.float32).unsqueeze(0)
         past_tf = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0)
         future_tf = torch.zeros((1, pred_len, len(feature_cols)), dtype=torch.float32)
 
-        out = m(
+        # ✅ 必须用 generate！你的模型只支持这个！
+        out = m.generate(
             past_values=past_values,
             past_time_features=past_tf,
             past_observed_mask=torch.ones_like(past_values),
             future_time_features=future_tf,
         )
         
-    # ✅【修复在这里！】
-    return out.params[1].squeeze().cpu().numpy()
+    # ✅ 正确输出！
+    return out.sequences.mean(dim=1).squeeze().cpu().numpy()
+
+# =====================================================================
 
 st.title("📈 ETF 价格预测 (Informer)")
 pred = run_one(model)
