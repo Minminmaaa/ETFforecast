@@ -57,7 +57,7 @@ else:
     def run_one(m: InformerForPrediction) -> np.ndarray:
         with torch.no_grad():
             out = m.generate(
-                past_values=torch.tensor(ctx[:, 3:4][None, :, :], dtype=torch.float32),
+                past_values=torch.tensor(ctx[:, 3:4].unsqueeze(0), dtype=torch.float32),
                 past_time_features=torch.tensor(ctx[None, :, :], dtype=torch.float32),
                 past_observed_mask=torch.ones((1, ws, 1), dtype=torch.float32),
                 future_time_features=torch.tensor(future[None, :, :], dtype=torch.float32),
