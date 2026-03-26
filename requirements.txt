@@ -8,4 +8,3 @@ scikit-learn
 joblib
 yfinance
 datasets
-ipywidgets  # 可能不需要，但保留
