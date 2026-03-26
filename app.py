@@ -41,7 +41,8 @@ def run_one(m):
             future_time_features=future_tf,
         )
         
-    return out.prediction_outputs.squeeze().cpu().numpy()
+    # ✅【修复在这里！】
+    return out.params[1].squeeze().cpu().numpy()
 
 st.title("📈 ETF 价格预测 (Informer)")
 pred = run_one(model)
