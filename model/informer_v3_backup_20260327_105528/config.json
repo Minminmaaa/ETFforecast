@@ -1,0 +1,48 @@
+{
+  "activation_dropout": 0.1,
+  "activation_function": "gelu",
+  "architectures": [
+    "InformerForPrediction"
+  ],
+  "attention_dropout": 0.1,
+  "attention_type": "prob",
+  "cardinality": [
+    0
+  ],
+  "context_length": 60,
+  "d_model": 256,
+  "decoder_attention_heads": 2,
+  "decoder_ffn_dim": 32,
+  "decoder_layerdrop": 0.1,
+  "decoder_layers": 1,
+  "distil": true,
+  "distribution_output": "student_t",
+  "dropout": 0.1,
+  "dtype": "float32",
+  "embedding_dimension": [
+    0
+  ],
+  "encoder_attention_heads": 2,
+  "encoder_ffn_dim": 32,
+  "encoder_layerdrop": 0.1,
+  "encoder_layers": 3,
+  "feature_size": 12,
+  "init_std": 0.02,
+  "input_size": 1,
+  "is_encoder_decoder": true,
+  "lags_sequence": [
+    0
+  ],
+  "loss": "nll",
+  "model_type": "informer",
+  "num_dynamic_real_features": 0,
+  "num_parallel_samples": 100,
+  "num_static_categorical_features": 0,
+  "num_static_real_features": 0,
+  "num_time_features": 9,
+  "prediction_length": 5,
+  "sampling_factor": 5,
+  "scaling": "mean",
+  "transformers_version": "5.3.0",
+  "use_cache": true
+}
