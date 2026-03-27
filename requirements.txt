@@ -8,4 +8,3 @@ torch>=2.3.0
 transformers>=4.42.0
 joblib>=1.4.0
 yfinance>=0.2.43
-ipywidgets>=8.0.0
