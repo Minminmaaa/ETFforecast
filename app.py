@@ -177,13 +177,13 @@ def main() -> None:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df[cols] = df[cols].ffill().bfill()
 
-    horizon = st.sidebar.slider("预测步长(天)", min_value=1, max_value=30, value=min(5, pred_len), step=1)
+    horizon = st.sidebar.slider("Forecast day(s)", min_value=1, max_value=30, value=min(5, pred_len), step=1)
 
     if use_model and models:
         model_options = list(models.keys())
         if len(model_options) >= 2:
             model_options.append("ensemble")
-        model_version = st.sidebar.selectbox("模型版本", model_options)
+        model_version = st.sidebar.selectbox("Model Version", model_options)
         x = scaler.transform(df[cols].values)
         infer_inputs = build_inference_tensors(x, window_size=window_size, pred_len=pred_len)
         model_preds: dict[str, np.ndarray] = {}
