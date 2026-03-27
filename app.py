@@ -1,160 +1,234 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import torch
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import joblib
+from __future__ import annotations
+
 from pathlib import Path
-from transformers import InformerForPrediction, InformerConfig
-from utils import (
-    load_etf_dataframe, add_target, BASE_FEATURES,
-    WindowConfig, InformerWindowDataset, InformerDataCollator
-)
+import json
 
-# 页面配置
-st.set_page_config(page_title="ETF Informer", layout="wide")
-st.title("📈 ETF 价格预测 - Informer 模型")
+import joblib
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import torch
+from datasets import load_dataset
+from transformers import InformerForPrediction
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-@st.cache_resource
-def load_models_and_scaler(model_dir="model"):
-    model_dir = Path(model_dir)
-    scaler = joblib.load(model_dir / "scaler.joblib")
-    models = {}
-    configs = {}
-    for name in ["informer", "informer_v2", "informer_v3"]:
-        try:
-            config = InformerConfig.from_pretrained(str(model_dir / name))
-            model = InformerForPrediction.from_pretrained(str(model_dir / name))
-            model.to(device)
-            model.eval()
-            models[name] = model
-            configs[name] = config
-        except Exception as e:
-            st.warning(f"无法加载模型 {name}: {e}")
-    return scaler, models, configs
+st.set_page_config(page_title="ETF Informer Dashboard", layout="wide")
+MODEL_ROOT_CANDIDATES = [Path("./model"), Path("./notebooks/model")]
+MODEL_CANDIDATE_DIRS = ["informer", "informer_v2", "informer_v3"]
+BASE_FEATURES = [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "CPI",
+    "Unemployment Rate",
+    "DXY",
+    "Gold/Copper Ratio",
+]
+
+
+def detect_model_root() -> Path | None:
+    for root in MODEL_ROOT_CANDIDATES:
+        if root.exists() and (root / "scaler.joblib").exists() and (root / "training_meta.json").exists():
+            return root
+    return None
+
+
+def discover_model_subdirs(model_root: Path) -> list[str]:
+    selected: list[str] = []
+    for base in MODEL_CANDIDATE_DIRS:
+        candidates = []
+        for p in model_root.iterdir():
+            if not p.is_dir():
+                continue
+            if p.name == base or p.name.startswith(base + "_backup_"):
+                if (p / "config.json").exists():
+                    candidates.append(p)
+        if candidates:
+            candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            selected.append(candidates[0].name)
+    return selected[:3]
+
+
+def extend_pred_to_horizon(pred: np.ndarray, horizon: int) -> np.ndarray:
+    pred = np.asarray(pred).reshape(-1)
+    if len(pred) >= horizon:
+        return pred[:horizon]
+    if len(pred) == 0:
+        return np.zeros(horizon, dtype=float)
+    tail = pred[-min(3, len(pred)) :]
+    fill = float(np.mean(tail))
+    extra = np.repeat(fill, horizon - len(pred))
+    return np.concatenate([pred, extra])
+
 
 @st.cache_data
-def load_data():
-    df = load_etf_dataframe()
-    df = add_target(df, pred_len=5)
-    return df
+def load_df(model_root: Path) -> pd.DataFrame:
+    cache_file = model_root / "dataset_cache.csv"
+    if cache_file.exists():
+        return pd.read_csv(cache_file, parse_dates=["Date"])
 
-def predict_returns(model, scaler, hist_df, pred_len, window_size, device):
-    """使用 forward 预测收益率（避免 generate 的维度错误）"""
-    X = scaler.transform(hist_df[BASE_FEATURES].values)
-    ctx = X[-window_size:]  # (window_size, num_features)
-    future_feat = np.repeat(ctx[-1:], pred_len, axis=0)  # (pred_len, num_features)
+    try:
+        ds = load_dataset("P2SAMAPA/my-etf-data")
+        split = "train" if "train" in ds else list(ds.keys())[0]
+        df = ds[split].to_pandas()
+        date_col = "Date" if "Date" in df.columns else "date"
+        df[date_col] = pd.to_datetime(df[date_col])
+        return df.sort_values(date_col).rename(columns={date_col: "Date"})
+    except Exception:
+        dates = pd.bdate_range("2018-01-01", periods=2000)
+        n = len(dates)
+        rng = np.random.default_rng(42)
+        returns = 0.0002 + 0.01 * rng.standard_normal(n)
+        close = 100 * np.exp(np.cumsum(returns))
+        open_ = close * (1 + 0.001 * rng.standard_normal(n))
+        high = np.maximum(open_, close) * (1 + np.abs(0.003 * rng.standard_normal(n)))
+        low = np.minimum(open_, close) * (1 - np.abs(0.003 * rng.standard_normal(n)))
+        volume = rng.integers(2_000_000, 10_000_000, n).astype(float)
+        return pd.DataFrame(
+            {
+                "Date": dates,
+                "Open": open_,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Volume": volume,
+                "CPI": 250 + np.cumsum(0.02 + 0.05 * rng.standard_normal(n)),
+                "Unemployment Rate": 5 + 0.5 * np.sin(np.linspace(0, 8 * np.pi, n)) + 0.2 * rng.standard_normal(n),
+                "DXY": 95 + np.cumsum(0.02 * rng.standard_normal(n)),
+                "Gold/Copper Ratio": 0.2 + 0.02 * np.sin(np.linspace(0, 10 * np.pi, n)),
+            }
+        )
 
-    past_val = torch.tensor(ctx[:, 3:4], dtype=torch.float32).unsqueeze(0).to(device)
-    past_time = torch.tensor(ctx, dtype=torch.float32).unsqueeze(0).to(device)
-    past_mask = torch.ones_like(past_val)
-    future_time = torch.tensor(future_feat, dtype=torch.float32).unsqueeze(0).to(device)
-    future_val = torch.zeros((1, pred_len, 1), dtype=torch.float32).to(device)
 
+def baseline_predict_returns(df: pd.DataFrame, horizon: int) -> np.ndarray:
+    pct = pd.to_numeric(df["Close"], errors="coerce").pct_change().dropna()
+    if len(pct) == 0:
+        return np.zeros(horizon, dtype=float)
+    mu = float(pct.tail(20).mean())
+    return np.repeat(mu, horizon).astype(float)
+
+
+def build_inference_tensors(
+    scaled_features: np.ndarray,
+    window_size: int,
+    pred_len: int,
+) -> dict[str, torch.Tensor]:
+    ctx = scaled_features[-window_size:]
+    future = np.repeat(ctx[-1:, :], pred_len, axis=0)
+    return {
+        "past_values": torch.tensor(ctx[:, 3][None, :], dtype=torch.float32),
+        "past_time_features": torch.tensor(ctx[None, :, :], dtype=torch.float32),
+        "past_observed_mask": torch.ones((1, window_size), dtype=torch.float32),
+        "future_time_features": torch.tensor(future[None, :, :], dtype=torch.float32),
+    }
+
+
+def run_one(model: InformerForPrediction, infer_inputs: dict[str, torch.Tensor]) -> np.ndarray:
+    model.eval()
     with torch.no_grad():
-        output = model(
-            past_values=past_val,
-            past_time_features=past_time,
-            past_observed_mask=past_mask,
-            future_values=future_val,
-            future_time_features=future_time,
-        )
-        # 输出结构：params[1] 是预测均值
-        pred = output.params[1].squeeze().cpu().numpy()
-    return pred
-
-def main():
-    st.sidebar.header("模型配置")
-    model_name = st.sidebar.selectbox("选择模型", ["informer", "informer_v2", "informer_v3"])
-    window_size = st.sidebar.slider("窗口大小（历史天数）", 30, 120, 60, step=10)
-    user_pred_len = st.sidebar.slider("预测天数", 1, 20, 5, step=1)
-
-    with st.spinner("加载模型和数据..."):
-        scaler, models, configs = load_models_and_scaler()
-        df = load_data()
-        model = models.get(model_name)
-        if model is None:
-            st.error(f"模型 {model_name} 加载失败，请检查模型文件。")
-            return
-        model_config = configs[model_name]
-        model_pred_len = model_config.prediction_length
-
-    st.subheader("数据概览")
-    st.write(f"数据时间范围: {df['Date'].min()} 至 {df['Date'].max()}")
-    st.write(f"总样本数: {len(df)}")
-    st.write(f"特征数量: {len(BASE_FEATURES)}")
-
-    st.subheader("实时预测")
-    col1, col2 = st.columns(2)
-    with col1:
-        min_date = pd.to_datetime(df['Date']).min()
-        max_date = pd.to_datetime(df['Date']).max()
-        start_date = st.date_input(
-            "参考日期（预测起点）",
-            value=pd.to_datetime(df['Date']).max() - timedelta(days=30),
-            min_value=min_date,
-            max_value=max_date
-        )
-    with col2:
-        st.write(f"模型最大预测长度: {model_pred_len} 天")
-        if user_pred_len > model_pred_len:
-            st.warning(f"请求的预测天数 ({user_pred_len}) 超过模型最大长度 ({model_pred_len})，将自动截断。")
-        pred_len_use = min(user_pred_len, model_pred_len)
-
-    if st.button("生成预测"):
-        with st.spinner("预测中..."):
-            selected_date = pd.to_datetime(start_date)
-            hist_df = df[pd.to_datetime(df['Date']) <= selected_date].reset_index(drop=True)
-            if len(hist_df) < window_size:
-                st.error(f"历史数据不足 {window_size} 天，请选择更晚的日期或减小窗口大小")
-                return
-
-            pred_returns = predict_returns(
-                model, scaler, hist_df, pred_len_use, window_size, device
+        try:
+            out = model.generate(
+                past_values=infer_inputs["past_values"],
+                past_time_features=infer_inputs["past_time_features"],
+                past_observed_mask=infer_inputs["past_observed_mask"],
+                future_time_features=infer_inputs["future_time_features"],
             )
+        except RuntimeError:
+            out = model.generate(
+                past_values=infer_inputs["past_values"].unsqueeze(-1),
+                past_time_features=infer_inputs["past_time_features"],
+                past_observed_mask=infer_inputs["past_observed_mask"].unsqueeze(-1),
+                future_time_features=infer_inputs["future_time_features"],
+            )
+    pred = out.sequences.mean(dim=1).squeeze(0)
+    if pred.ndim > 1:
+        pred = pred.squeeze(-1)
+    return pred.cpu().numpy()
 
-            last_close = hist_df['Close'].iloc[-1]
-            pred_prices = [last_close]
-            for r in pred_returns:
-                pred_prices.append(pred_prices[-1] * (1 + r))
-            pred_prices = np.array(pred_prices[1:])
 
-            last_date = selected_date
-            future_dates = pd.bdate_range(start=last_date + timedelta(days=1), periods=pred_len_use)
+def main() -> None:
+    st.title("ETF Predictive Allocation")
 
-            hist_plot = hist_df.tail(window_size).copy()
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist_plot['Date'], y=hist_plot['Close'], name='历史价格', line=dict(color='steelblue')))
-            fig.add_trace(go.Scatter(x=future_dates, y=pred_prices, name='预测价格', mode='lines+markers',
-                                     line=dict(color='orange', dash='dash'), marker=dict(size=8)))
-            fig.add_vline(x=selected_date, line=dict(color='red', dash='dot'))
-            fig.add_annotation(x=selected_date, y=1, yref='paper', text='参考点', showarrow=False, xanchor='left', yshift=10)
-            fig.update_layout(title=f"{model_name} 预测 (窗口={window_size}天)",
-                              xaxis_title="日期", yaxis_title="收盘价", template="plotly_dark", hovermode='x unified')
-            st.plotly_chart(fig, use_container_width=True)
+    model_root = detect_model_root()
+    use_model = model_root is not None
 
-            st.subheader("预测摘要")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("参考日期", selected_date.date())
-            col2.metric("参考收盘价", f"{last_close:.2f}")
-            col3.metric(f"{pred_len_use} 天后价格", f"{pred_prices[-1]:.2f}")
-            col4.metric("预期收益率", f"{(pred_prices[-1]/last_close - 1)*100:.2f}%")
+    if use_model:
+        scaler = joblib.load(model_root / "scaler.joblib")
+        meta = json.loads((model_root / "training_meta.json").read_text(encoding="utf-8"))
+        model_subdirs = discover_model_subdirs(model_root)
+        models = {d: InformerForPrediction.from_pretrained(str(model_root / d)) for d in model_subdirs}
+        feature_cols = [c for c in meta.get("feature_cols", BASE_FEATURES)]
+        window_size = int(meta.get("window_size", 60))
+        pred_len = int(meta.get("pred_len", 5))
+    else:
+        st.warning("未检测到本地模型文件，当前使用 baseline 预测模式。")
+        scaler = None
+        models = {}
+        feature_cols = BASE_FEATURES
+        window_size = 60
+        pred_len = 5
 
-            pred_df = pd.DataFrame({"日期": future_dates, "预测收益率": pred_returns, "预测收盘价": pred_prices})
-            st.dataframe(pred_df)
+    df = load_df(model_root if model_root is not None else Path("."))
+    cols = [c for c in feature_cols if c in df.columns]
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df[cols] = df[cols].ffill().bfill()
 
-    st.subheader("特征相关性分析")
-    corr = df[BASE_FEATURES].corr()
-    fig_corr = px.imshow(corr, text_auto='.2f', color_continuous_scale='RdBu_r', title="特征相关性热图", aspect='auto')
-    fig_corr.update_layout(template='plotly_dark')
-    st.plotly_chart(fig_corr, use_container_width=True)
+    horizon = st.sidebar.slider("预测步长(天)", min_value=1, max_value=30, value=min(5, pred_len), step=1)
 
-    st.subheader("模型评估")
-    st.write("测试集 RMSE ≈ 0.0214 (基于原始 notebook 结果)")
+    if use_model and models:
+        model_options = list(models.keys())
+        if len(model_options) >= 2:
+            model_options.append("ensemble")
+        model_version = st.sidebar.selectbox("模型版本", model_options)
+        x = scaler.transform(df[cols].values)
+        infer_inputs = build_inference_tensors(x, window_size=window_size, pred_len=pred_len)
+        model_preds: dict[str, np.ndarray] = {}
+        for name, m in models.items():
+            try:
+                model_preds[name] = run_one(m, infer_inputs)
+            except Exception:
+                continue
+
+        if model_preds:
+            if model_version == "ensemble":
+                pred = np.mean(np.stack(list(model_preds.values()), axis=0), axis=0)
+            elif model_version in model_preds:
+                pred = model_preds[model_version]
+            else:
+                first_ok = next(iter(model_preds.keys()))
+                st.warning(f"所选模型 {model_version} {first_ok}。")
+                model_version = first_ok
+                pred = model_preds[first_ok]
+            pred = extend_pred_to_horizon(pred, horizon)
+        else:
+            st.warning("。")
+            model_version = "baseline"
+            pred = baseline_predict_returns(df, horizon)
+    else:
+        model_version = "baseline"
+        pred = baseline_predict_returns(df, horizon)
+
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    last_close = float(close.iloc[-1])
+    future_dates = pd.bdate_range(pd.to_datetime(df["Date"].iloc[-1]), periods=horizon + 1)[1:]
+
+    pred_price = [last_close]
+    for r in pred:
+        pred_price.append(pred_price[-1] * (1 + float(r)))
+    pred_price = np.array(pred_price[1:])
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=pd.to_datetime(df["Date"]).tail(250), y=close.tail(250), name="Actual"))
+    fig.add_trace(go.Scatter(x=future_dates, y=pred_price, name="Predicted"))
+    fig.update_layout(template="plotly_dark", title="Price Forecast")
+    st.plotly_chart(fig, width="stretch")
+
+    st.caption(f"Model: {model_version} | Root: {str(model_root) if model_root else 'none'}")
+
 
 if __name__ == "__main__":
     main()
